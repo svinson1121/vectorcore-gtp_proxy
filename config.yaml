@@ -1,10 +1,4 @@
 proxy:
-  gtpc:
-    listen: "0.0.0.0:2123"
-    advertise_address_ipv4: "127.0.0.1"
-  gtpu:
-    listen: "0.0.0.0:2152"
-    advertise_address_ipv4: "127.0.0.1"
   timeouts:
     session_idle: "15m"
     cleanup_interval: "30s"
@@ -14,6 +8,7 @@ api:
 
 log:
   level: "info"
+  file: "./gtp_proxy.log"
 
 database:
   path: "./gtp_proxy.db"

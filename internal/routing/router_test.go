@@ -9,8 +9,8 @@ import (
 func TestSelectUsesAPNThenDefault(t *testing.T) {
 	cfg := config.Config{
 		Peers: []config.PeerConfig{
-			{Name: "default", Address: "127.0.0.1:3123", Enabled: true},
-			{Name: "ims", Address: "127.0.0.1:4123", Enabled: true},
+			{Name: "default", Address: "127.0.0.1:3123", TransportDomain: "home-default", Enabled: true},
+			{Name: "ims", Address: "127.0.0.1:4123", TransportDomain: "home-ims", Enabled: true},
 		},
 		Routing: config.RoutingConfig{
 			DefaultPeer: "default",
@@ -24,7 +24,7 @@ func TestSelectUsesAPNThenDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Select() error = %v", err)
 	}
-	if match.Peer.Name != "ims" || match.MatchType != "apn" {
+	if match.Peer.Name != "ims" || match.MatchType != "apn" || match.TransportDomain != "home-ims" {
 		t.Fatalf("unexpected APN match %#v", match)
 	}
 
@@ -32,7 +32,7 @@ func TestSelectUsesAPNThenDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Select() default error = %v", err)
 	}
-	if match.Peer.Name != "default" || match.MatchType != "default" {
+	if match.Peer.Name != "default" || match.MatchType != "default" || match.TransportDomain != "home-default" {
 		t.Fatalf("unexpected default match %#v", match)
 	}
 }
@@ -93,5 +93,45 @@ func TestSelectUsesPhaseThreePrecedence(t *testing.T) {
 	}
 	if match.Peer.Name != "plmn" || match.MatchType != "plmn" {
 		t.Fatalf("unexpected PLMN match %#v", match)
+	}
+}
+
+func TestSelectSupportsDNSDiscoveryRoute(t *testing.T) {
+	cfg := config.Config{
+		TransportDomains: []config.TransportDomainConfig{
+			{
+				Name:              "home-a",
+				Enabled:           true,
+				NetNSPath:         "/var/run/netns/home-a",
+				GTPCListenHost:    "192.0.2.10",
+				GTPCPort:          2123,
+				GTPUListenHost:    "192.0.2.10",
+				GTPUPort:          2152,
+				GTPCAdvertiseIPv4: "192.0.2.10",
+				GTPUAdvertiseIPv4: "192.0.2.10",
+			},
+		},
+		Routing: config.RoutingConfig{
+			APNRoutes: []config.APNRoute{
+				{
+					APN:             "ims",
+					ActionType:      "dns_discovery",
+					TransportDomain: "home-a",
+					FQDN:            "pgw.example.net",
+					Service:         "x-3gpp-pgw",
+				},
+			},
+		},
+	}
+
+	match, err := Select(cfg, Input{APN: "ims"})
+	if err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	if match.ActionType != "dns_discovery" || match.TransportDomain != "home-a" || match.FQDN != "pgw.example.net" {
+		t.Fatalf("unexpected DNS discovery match %#v", match)
+	}
+	if match.Peer.Name != "" {
+		t.Fatalf("unexpected peer on DNS discovery match %#v", match)
 	}
 }

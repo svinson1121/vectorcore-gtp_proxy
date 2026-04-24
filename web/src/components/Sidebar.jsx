@@ -1,9 +1,10 @@
 import React from 'react'
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, Network, GitBranch, Layers3, Settings } from 'lucide-react'
+import { LayoutDashboard, Cable, Network, GitBranch, Layers3, Settings } from 'lucide-react'
 
 const NAV_ITEMS = [
   { to: '/dashboard', label: 'Dashboard', icon: <LayoutDashboard size={16} /> },
+  { to: '/transport', label: 'Transport', icon: <Cable size={16} /> },
   { to: '/peers',     label: 'Peers',     icon: <Network size={16} /> },
   { to: '/routing',   label: 'Routing',   icon: <GitBranch size={16} /> },
   { to: '/sessions',  label: 'Sessions',  icon: <Layers3 size={16} /> },

@@ -16,8 +16,10 @@ type sqliteStore struct {
 const maxAuditEntries = 100
 
 type mutableSnapshot struct {
-	Peers   []PeerConfig
-	Routing RoutingConfig
+	TransportDomains []TransportDomainConfig
+	DNSResolvers     []DNSResolverConfig
+	Peers            []PeerConfig
+	Routing          RoutingConfig
 }
 
 func openSQLiteStore(cfg DatabaseConfig) (*sqliteStore, error) {
@@ -27,7 +29,7 @@ func openSQLiteStore(cfg DatabaseConfig) (*sqliteStore, error) {
 	}
 
 	store := &sqliteStore{db: db}
-	if err := store.init(context.Background()); err != nil {
+	if err := applySQLiteMigrations(context.Background(), db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -38,59 +40,20 @@ func (s *sqliteStore) Close() error {
 	return s.db.Close()
 }
 
-func (s *sqliteStore) init(ctx context.Context) error {
-	statements := []string{
-		`CREATE TABLE IF NOT EXISTS peers (
-			name TEXT PRIMARY KEY,
-			address TEXT NOT NULL,
-			enabled INTEGER NOT NULL DEFAULT 1,
-			description TEXT NOT NULL DEFAULT ''
-		)`,
-		`CREATE TABLE IF NOT EXISTS routing_settings (
-			key TEXT PRIMARY KEY,
-			value TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS apn_routes (
-			apn TEXT PRIMARY KEY,
-			peer TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS imsi_routes (
-			imsi TEXT PRIMARY KEY,
-			peer TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS imsi_prefix_routes (
-			prefix TEXT PRIMARY KEY,
-			peer TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS plmn_routes (
-			plmn TEXT PRIMARY KEY,
-			peer TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS audit_log (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			action TEXT NOT NULL,
-			object_type TEXT NOT NULL,
-			object_key TEXT NOT NULL,
-			before_json TEXT NOT NULL DEFAULT '',
-			after_json TEXT NOT NULL DEFAULT '',
-			created_at TEXT NOT NULL
-		)`,
-	}
-
-	for _, stmt := range statements {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("initialize sqlite config store: %w", err)
-		}
-	}
-	return nil
-}
-
 func (s *sqliteStore) load(ctx context.Context, tx *sql.Tx) (mutableSnapshot, error) {
 	query := querier(s.db)
 	if tx != nil {
 		query = tx
 	}
 
+	transportDomains, err := loadTransportDomains(ctx, query)
+	if err != nil {
+		return mutableSnapshot{}, err
+	}
+	dnsResolvers, err := loadDNSResolvers(ctx, query)
+	if err != nil {
+		return mutableSnapshot{}, err
+	}
 	peers, err := loadPeers(ctx, query)
 	if err != nil {
 		return mutableSnapshot{}, err
@@ -117,7 +80,9 @@ func (s *sqliteStore) load(ctx context.Context, tx *sql.Tx) (mutableSnapshot, er
 	}
 
 	return mutableSnapshot{
-		Peers: peers,
+		TransportDomains: transportDomains,
+		DNSResolvers:     dnsResolvers,
+		Peers:            peers,
 		Routing: RoutingConfig{
 			DefaultPeer:      defaultPeer,
 			IMSIRoutes:       imsiRoutes,
@@ -128,19 +93,111 @@ func (s *sqliteStore) load(ctx context.Context, tx *sql.Tx) (mutableSnapshot, er
 	}, nil
 }
 
+func (s *sqliteStore) upsertTransportDomain(ctx context.Context, tx *sql.Tx, domain TransportDomainConfig) error {
+	if strings.TrimSpace(domain.Description) == "" {
+		domain.Description = domain.Name
+	}
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO transport_domains(
+			name, description, netns_path, enabled,
+			gtpc_listen_host, gtpc_port, gtpu_listen_host, gtpu_port,
+			gtpc_advertise_ipv4, gtpc_advertise_ipv6, gtpu_advertise_ipv4, gtpu_advertise_ipv6
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET
+			description = excluded.description,
+			netns_path = excluded.netns_path,
+			enabled = excluded.enabled,
+			gtpc_listen_host = excluded.gtpc_listen_host,
+			gtpc_port = excluded.gtpc_port,
+			gtpu_listen_host = excluded.gtpu_listen_host,
+			gtpu_port = excluded.gtpu_port,
+			gtpc_advertise_ipv4 = excluded.gtpc_advertise_ipv4,
+			gtpc_advertise_ipv6 = excluded.gtpc_advertise_ipv6,
+			gtpu_advertise_ipv4 = excluded.gtpu_advertise_ipv4,
+			gtpu_advertise_ipv6 = excluded.gtpu_advertise_ipv6`,
+		domain.Name,
+		domain.Description,
+		domain.NetNSPath,
+		boolToInt(domain.Enabled),
+		domain.GTPCListenHost,
+		domain.GTPCPort,
+		domain.GTPUListenHost,
+		domain.GTPUPort,
+		domain.GTPCAdvertiseIPv4,
+		domain.GTPCAdvertiseIPv6,
+		domain.GTPUAdvertiseIPv4,
+		domain.GTPUAdvertiseIPv6,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert transport domain %q: %w", domain.Name, err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) deleteTransportDomain(ctx context.Context, tx *sql.Tx, name string) error {
+	result, err := tx.ExecContext(ctx, `DELETE FROM transport_domains WHERE name = ?`, name)
+	if err != nil {
+		return fmt.Errorf("delete transport domain %q: %w", name, err)
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return fmt.Errorf("transport domain %q not found", name)
+	}
+	return nil
+}
+
+func (s *sqliteStore) upsertDNSResolver(ctx context.Context, tx *sql.Tx, resolver DNSResolverConfig) error {
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO dns_resolvers(name, transport_domain, server, priority, timeout_ms, attempts, search_domain, enabled)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(name) DO UPDATE SET
+			transport_domain = excluded.transport_domain,
+			server = excluded.server,
+			priority = excluded.priority,
+			timeout_ms = excluded.timeout_ms,
+			attempts = excluded.attempts,
+			search_domain = excluded.search_domain,
+			enabled = excluded.enabled`,
+		resolver.Name,
+		resolver.TransportDomain,
+		resolver.Server,
+		resolver.Priority,
+		resolver.TimeoutMS,
+		resolver.Attempts,
+		resolver.SearchDomain,
+		boolToInt(resolver.Enabled),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert DNS resolver %q: %w", resolver.Name, err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) deleteDNSResolver(ctx context.Context, tx *sql.Tx, name string) error {
+	result, err := tx.ExecContext(ctx, `DELETE FROM dns_resolvers WHERE name = ?`, name)
+	if err != nil {
+		return fmt.Errorf("delete DNS resolver %q: %w", name, err)
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return fmt.Errorf("DNS resolver %q not found", name)
+	}
+	return nil
+}
+
 func (s *sqliteStore) upsertPeer(ctx context.Context, tx *sql.Tx, peer PeerConfig) error {
 	if strings.TrimSpace(peer.Description) == "" {
 		peer.Description = peer.Name
 	}
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO peers(name, address, enabled, description)
-		 VALUES(?, ?, ?, ?)
+		`INSERT INTO peers(name, address, transport_domain, enabled, description)
+		 VALUES(?, ?, ?, ?, ?)
 		 ON CONFLICT(name) DO UPDATE SET
 		   address = excluded.address,
+		   transport_domain = excluded.transport_domain,
 		   enabled = excluded.enabled,
 		   description = excluded.description`,
 		peer.Name,
 		peer.Address,
+		peer.TransportDomain,
 		boolToInt(peer.Enabled),
 		peer.Description,
 	)
@@ -176,11 +233,20 @@ func (s *sqliteStore) setDefaultPeer(ctx context.Context, tx *sql.Tx, name strin
 
 func (s *sqliteStore) upsertAPNRoute(ctx context.Context, tx *sql.Tx, route APNRoute) error {
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO apn_routes(apn, peer)
-		 VALUES(?, ?)
-		 ON CONFLICT(apn) DO UPDATE SET peer = excluded.peer`,
+		`INSERT INTO apn_routes(apn, peer, action_type, transport_domain, fqdn, service)
+		 VALUES(?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(apn) DO UPDATE SET
+			peer = excluded.peer,
+			action_type = excluded.action_type,
+			transport_domain = excluded.transport_domain,
+			fqdn = excluded.fqdn,
+			service = excluded.service`,
 		route.APN,
 		route.Peer,
+		normalizeRouteActionType(route.ActionType),
+		route.TransportDomain,
+		route.FQDN,
+		route.Service,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert APN route %q: %w", route.APN, err)
@@ -202,11 +268,20 @@ func (s *sqliteStore) deleteAPNRoute(ctx context.Context, tx *sql.Tx, apn string
 func (s *sqliteStore) upsertIMSIRoute(ctx context.Context, tx *sql.Tx, route IMSIRoute) error {
 	key := normalizeDigits(route.IMSI)
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO imsi_routes(imsi, peer)
-		 VALUES(?, ?)
-		 ON CONFLICT(imsi) DO UPDATE SET peer = excluded.peer`,
+		`INSERT INTO imsi_routes(imsi, peer, action_type, transport_domain, fqdn, service)
+		 VALUES(?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(imsi) DO UPDATE SET
+			peer = excluded.peer,
+			action_type = excluded.action_type,
+			transport_domain = excluded.transport_domain,
+			fqdn = excluded.fqdn,
+			service = excluded.service`,
 		key,
 		route.Peer,
+		normalizeRouteActionType(route.ActionType),
+		route.TransportDomain,
+		route.FQDN,
+		route.Service,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert IMSI route %q: %w", route.IMSI, err)
@@ -229,11 +304,20 @@ func (s *sqliteStore) deleteIMSIRoute(ctx context.Context, tx *sql.Tx, imsi stri
 func (s *sqliteStore) upsertIMSIPrefixRoute(ctx context.Context, tx *sql.Tx, route IMSIPrefixRoute) error {
 	key := normalizeDigits(route.Prefix)
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO imsi_prefix_routes(prefix, peer)
-		 VALUES(?, ?)
-		 ON CONFLICT(prefix) DO UPDATE SET peer = excluded.peer`,
+		`INSERT INTO imsi_prefix_routes(prefix, peer, action_type, transport_domain, fqdn, service)
+		 VALUES(?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(prefix) DO UPDATE SET
+			peer = excluded.peer,
+			action_type = excluded.action_type,
+			transport_domain = excluded.transport_domain,
+			fqdn = excluded.fqdn,
+			service = excluded.service`,
 		key,
 		route.Peer,
+		normalizeRouteActionType(route.ActionType),
+		route.TransportDomain,
+		route.FQDN,
+		route.Service,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert IMSI prefix route %q: %w", route.Prefix, err)
@@ -256,11 +340,20 @@ func (s *sqliteStore) deleteIMSIPrefixRoute(ctx context.Context, tx *sql.Tx, pre
 func (s *sqliteStore) upsertPLMNRoute(ctx context.Context, tx *sql.Tx, route PLMNRoute) error {
 	key := normalizeDigits(route.PLMN)
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO plmn_routes(plmn, peer)
-		 VALUES(?, ?)
-		 ON CONFLICT(plmn) DO UPDATE SET peer = excluded.peer`,
+		`INSERT INTO plmn_routes(plmn, peer, action_type, transport_domain, fqdn, service)
+		 VALUES(?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(plmn) DO UPDATE SET
+			peer = excluded.peer,
+			action_type = excluded.action_type,
+			transport_domain = excluded.transport_domain,
+			fqdn = excluded.fqdn,
+			service = excluded.service`,
 		key,
 		route.Peer,
+		normalizeRouteActionType(route.ActionType),
+		route.TransportDomain,
+		route.FQDN,
+		route.Service,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert PLMN route %q: %w", route.PLMN, err)
@@ -340,7 +433,7 @@ type querier interface {
 }
 
 func loadPeers(ctx context.Context, q querier) ([]PeerConfig, error) {
-	rows, err := q.QueryContext(ctx, `SELECT name, address, enabled, description FROM peers ORDER BY name`)
+	rows, err := q.QueryContext(ctx, `SELECT name, address, transport_domain, enabled, description FROM peers ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("load peers: %w", err)
 	}
@@ -350,7 +443,7 @@ func loadPeers(ctx context.Context, q querier) ([]PeerConfig, error) {
 	for rows.Next() {
 		var peer PeerConfig
 		var enabled int
-		if err := rows.Scan(&peer.Name, &peer.Address, &enabled, &peer.Description); err != nil {
+		if err := rows.Scan(&peer.Name, &peer.Address, &peer.TransportDomain, &enabled, &peer.Description); err != nil {
 			return nil, fmt.Errorf("scan peer: %w", err)
 		}
 		peer.Enabled = enabled != 0
@@ -360,6 +453,82 @@ func loadPeers(ctx context.Context, q querier) ([]PeerConfig, error) {
 		return nil, fmt.Errorf("iterate peers: %w", err)
 	}
 	return peers, nil
+}
+
+func loadTransportDomains(ctx context.Context, q querier) ([]TransportDomainConfig, error) {
+	rows, err := q.QueryContext(ctx, `SELECT
+		name, description, netns_path, enabled,
+		gtpc_listen_host, gtpc_port, gtpu_listen_host, gtpu_port,
+		gtpc_advertise_ipv4, gtpc_advertise_ipv6, gtpu_advertise_ipv4, gtpu_advertise_ipv6
+		FROM transport_domains
+		ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("load transport domains: %w", err)
+	}
+	defer rows.Close()
+
+	var domains []TransportDomainConfig
+	for rows.Next() {
+		var domain TransportDomainConfig
+		var enabled int
+		if err := rows.Scan(
+			&domain.Name,
+			&domain.Description,
+			&domain.NetNSPath,
+			&enabled,
+			&domain.GTPCListenHost,
+			&domain.GTPCPort,
+			&domain.GTPUListenHost,
+			&domain.GTPUPort,
+			&domain.GTPCAdvertiseIPv4,
+			&domain.GTPCAdvertiseIPv6,
+			&domain.GTPUAdvertiseIPv4,
+			&domain.GTPUAdvertiseIPv6,
+		); err != nil {
+			return nil, fmt.Errorf("scan transport domain: %w", err)
+		}
+		domain.Enabled = enabled != 0
+		domains = append(domains, domain)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate transport domains: %w", err)
+	}
+	return domains, nil
+}
+
+func loadDNSResolvers(ctx context.Context, q querier) ([]DNSResolverConfig, error) {
+	rows, err := q.QueryContext(ctx, `SELECT
+		name, transport_domain, server, priority, timeout_ms, attempts, search_domain, enabled
+		FROM dns_resolvers
+		ORDER BY transport_domain, priority, name`)
+	if err != nil {
+		return nil, fmt.Errorf("load DNS resolvers: %w", err)
+	}
+	defer rows.Close()
+
+	var resolvers []DNSResolverConfig
+	for rows.Next() {
+		var resolver DNSResolverConfig
+		var enabled int
+		if err := rows.Scan(
+			&resolver.Name,
+			&resolver.TransportDomain,
+			&resolver.Server,
+			&resolver.Priority,
+			&resolver.TimeoutMS,
+			&resolver.Attempts,
+			&resolver.SearchDomain,
+			&enabled,
+		); err != nil {
+			return nil, fmt.Errorf("scan DNS resolver: %w", err)
+		}
+		resolver.Enabled = enabled != 0
+		resolvers = append(resolvers, resolver)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate DNS resolvers: %w", err)
+	}
+	return resolvers, nil
 }
 
 func loadDefaultPeer(ctx context.Context, q querier) (string, error) {
@@ -375,7 +544,7 @@ func loadDefaultPeer(ctx context.Context, q querier) (string, error) {
 }
 
 func loadAPNRoutes(ctx context.Context, q querier) ([]APNRoute, error) {
-	rows, err := q.QueryContext(ctx, `SELECT apn, peer FROM apn_routes ORDER BY lower(trim(apn))`)
+	rows, err := q.QueryContext(ctx, `SELECT apn, peer, action_type, transport_domain, fqdn, service FROM apn_routes ORDER BY lower(trim(apn))`)
 	if err != nil {
 		return nil, fmt.Errorf("load APN routes: %w", err)
 	}
@@ -384,7 +553,7 @@ func loadAPNRoutes(ctx context.Context, q querier) ([]APNRoute, error) {
 	var routes []APNRoute
 	for rows.Next() {
 		var route APNRoute
-		if err := rows.Scan(&route.APN, &route.Peer); err != nil {
+		if err := rows.Scan(&route.APN, &route.Peer, &route.ActionType, &route.TransportDomain, &route.FQDN, &route.Service); err != nil {
 			return nil, fmt.Errorf("scan APN route: %w", err)
 		}
 		routes = append(routes, route)
@@ -396,7 +565,7 @@ func loadAPNRoutes(ctx context.Context, q querier) ([]APNRoute, error) {
 }
 
 func loadIMSIRoutes(ctx context.Context, q querier) ([]IMSIRoute, error) {
-	rows, err := q.QueryContext(ctx, `SELECT imsi, peer FROM imsi_routes ORDER BY imsi`)
+	rows, err := q.QueryContext(ctx, `SELECT imsi, peer, action_type, transport_domain, fqdn, service FROM imsi_routes ORDER BY imsi`)
 	if err != nil {
 		return nil, fmt.Errorf("load IMSI routes: %w", err)
 	}
@@ -405,7 +574,7 @@ func loadIMSIRoutes(ctx context.Context, q querier) ([]IMSIRoute, error) {
 	var routes []IMSIRoute
 	for rows.Next() {
 		var route IMSIRoute
-		if err := rows.Scan(&route.IMSI, &route.Peer); err != nil {
+		if err := rows.Scan(&route.IMSI, &route.Peer, &route.ActionType, &route.TransportDomain, &route.FQDN, &route.Service); err != nil {
 			return nil, fmt.Errorf("scan IMSI route: %w", err)
 		}
 		routes = append(routes, route)
@@ -417,7 +586,7 @@ func loadIMSIRoutes(ctx context.Context, q querier) ([]IMSIRoute, error) {
 }
 
 func loadIMSIPrefixRoutes(ctx context.Context, q querier) ([]IMSIPrefixRoute, error) {
-	rows, err := q.QueryContext(ctx, `SELECT prefix, peer FROM imsi_prefix_routes ORDER BY length(prefix) DESC, prefix`)
+	rows, err := q.QueryContext(ctx, `SELECT prefix, peer, action_type, transport_domain, fqdn, service FROM imsi_prefix_routes ORDER BY length(prefix) DESC, prefix`)
 	if err != nil {
 		return nil, fmt.Errorf("load IMSI prefix routes: %w", err)
 	}
@@ -426,7 +595,7 @@ func loadIMSIPrefixRoutes(ctx context.Context, q querier) ([]IMSIPrefixRoute, er
 	var routes []IMSIPrefixRoute
 	for rows.Next() {
 		var route IMSIPrefixRoute
-		if err := rows.Scan(&route.Prefix, &route.Peer); err != nil {
+		if err := rows.Scan(&route.Prefix, &route.Peer, &route.ActionType, &route.TransportDomain, &route.FQDN, &route.Service); err != nil {
 			return nil, fmt.Errorf("scan IMSI prefix route: %w", err)
 		}
 		routes = append(routes, route)
@@ -438,7 +607,7 @@ func loadIMSIPrefixRoutes(ctx context.Context, q querier) ([]IMSIPrefixRoute, er
 }
 
 func loadPLMNRoutes(ctx context.Context, q querier) ([]PLMNRoute, error) {
-	rows, err := q.QueryContext(ctx, `SELECT plmn, peer FROM plmn_routes ORDER BY plmn`)
+	rows, err := q.QueryContext(ctx, `SELECT plmn, peer, action_type, transport_domain, fqdn, service FROM plmn_routes ORDER BY plmn`)
 	if err != nil {
 		return nil, fmt.Errorf("load PLMN routes: %w", err)
 	}
@@ -447,7 +616,7 @@ func loadPLMNRoutes(ctx context.Context, q querier) ([]PLMNRoute, error) {
 	var routes []PLMNRoute
 	for rows.Next() {
 		var route PLMNRoute
-		if err := rows.Scan(&route.PLMN, &route.Peer); err != nil {
+		if err := rows.Scan(&route.PLMN, &route.Peer, &route.ActionType, &route.TransportDomain, &route.FQDN, &route.Service); err != nil {
 			return nil, fmt.Errorf("scan PLMN route: %w", err)
 		}
 		routes = append(routes, route)

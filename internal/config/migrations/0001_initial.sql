@@ -1,0 +1,41 @@
+CREATE TABLE IF NOT EXISTS peers (
+	name TEXT PRIMARY KEY,
+	address TEXT NOT NULL,
+	enabled INTEGER NOT NULL DEFAULT 1,
+	description TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS routing_settings (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS apn_routes (
+	apn TEXT PRIMARY KEY,
+	peer TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS imsi_routes (
+	imsi TEXT PRIMARY KEY,
+	peer TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS imsi_prefix_routes (
+	prefix TEXT PRIMARY KEY,
+	peer TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plmn_routes (
+	plmn TEXT PRIMARY KEY,
+	peer TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	action TEXT NOT NULL,
+	object_type TEXT NOT NULL,
+	object_key TEXT NOT NULL,
+	before_json TEXT NOT NULL DEFAULT '',
+	after_json TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL
+);

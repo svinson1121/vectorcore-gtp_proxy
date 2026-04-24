@@ -1,7 +1,7 @@
 .PHONY: ui build test clean dev-ui all
 
 BINARY  = gtp_proxy
-VERSION = 0.0.1d
+VERSION ?= 0.0.1d
 
 all: ui build
 

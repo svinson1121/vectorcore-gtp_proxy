@@ -17,8 +17,17 @@ const (
 	messageTypeModifyBearerResp     = 35
 	messageTypeDeleteSessionRequest = 36
 	messageTypeDeleteSessionResp    = 37
+	messageTypeCreateBearerRequest  = 95
+	messageTypeCreateBearerResp     = 96
+	messageTypeUpdateBearerRequest  = 97
+	messageTypeUpdateBearerResp     = 98
+	messageTypeDeleteBearerRequest  = 99
+	messageTypeDeleteBearerResp     = 100
+	messageTypeReleaseAccessReq     = 170
+	messageTypeReleaseAccessResp    = 171
 
 	ieTypeIMSI          = 1
+	ieTypeCause         = 2
 	ieTypeRecovery      = 3
 	ieTypeAPN           = 71
 	ieTypeFTEID         = 87
@@ -231,7 +240,7 @@ func ExtractCreateSessionMetadata(payload []byte) (imsi, apn string, visitedCont
 		case ieTypeFTEID:
 			if visitedControlTEID == 0 {
 				fteid, parseErr := ParseFTEID(ie.Payload)
-				if parseErr == nil {
+				if parseErr == nil && isControlPlaneInterfaceType(fteid.InterfaceType) {
 					visitedControlTEID = fteid.TEID
 				}
 			}
@@ -246,6 +255,32 @@ func ExtractFirstFTEID(payload []byte) (FTEID, bool) {
 		return FTEID{}, false
 	}
 	return all[0], true
+}
+
+func ExtractFirstControlPlaneFTEID(payload []byte) (FTEID, bool) {
+	all, err := ExtractAllFTEIDs(payload)
+	if err != nil {
+		return FTEID{}, false
+	}
+	for _, fteid := range all {
+		if isControlPlaneInterfaceType(fteid.InterfaceType) {
+			return fteid, true
+		}
+	}
+	return FTEID{}, false
+}
+
+func ExtractCause(payload []byte) (uint8, bool) {
+	ies, err := ParseIEs(payload)
+	if err != nil {
+		return 0, false
+	}
+	for _, ie := range ies {
+		if ie.Type == ieTypeCause && len(ie.Payload) > 0 {
+			return ie.Payload[0], true
+		}
+	}
+	return 0, false
 }
 
 func ExtractAllFTEIDs(payload []byte) ([]FTEID, error) {
@@ -337,4 +372,22 @@ func (f FTEID) HasIPv4() bool {
 func (f FTEID) HasIPv6() bool {
 	ip := f.IPv6.To16()
 	return ip != nil && ip.To4() == nil
+}
+
+func isControlPlaneInterfaceType(interfaceType uint8) bool {
+	switch interfaceType {
+	case 6, 7, 10, 11:
+		return true
+	default:
+		return false
+	}
+}
+
+func isUserPlaneInterfaceType(interfaceType uint8) bool {
+	switch interfaceType {
+	case 0, 1, 4, 5:
+		return true
+	default:
+		return false
+	}
 }

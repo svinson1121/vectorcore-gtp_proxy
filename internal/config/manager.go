@@ -79,6 +79,38 @@ func (m *Manager) UpsertPeer(peer PeerConfig) (Config, error) {
 	})
 }
 
+func (m *Manager) UpsertTransportDomain(domain TransportDomainConfig) (Config, error) {
+	return m.mutate("upsert", "transport_domain", domain.Name, findTransportDomain(m.Snapshot(), domain.Name), func(ctx context.Context, tx *sql.Tx) error {
+		return m.store.upsertTransportDomain(ctx, tx, domain)
+	}, func(cfg Config) any {
+		return findTransportDomain(cfg, domain.Name)
+	})
+}
+
+func (m *Manager) DeleteTransportDomain(name string) (Config, error) {
+	return m.mutate("delete", "transport_domain", name, findTransportDomain(m.Snapshot(), name), func(ctx context.Context, tx *sql.Tx) error {
+		return m.store.deleteTransportDomain(ctx, tx, name)
+	}, func(cfg Config) any {
+		return nil
+	})
+}
+
+func (m *Manager) UpsertDNSResolver(resolver DNSResolverConfig) (Config, error) {
+	return m.mutate("upsert", "dns_resolver", resolver.Name, findDNSResolver(m.Snapshot(), resolver.Name), func(ctx context.Context, tx *sql.Tx) error {
+		return m.store.upsertDNSResolver(ctx, tx, resolver)
+	}, func(cfg Config) any {
+		return findDNSResolver(cfg, resolver.Name)
+	})
+}
+
+func (m *Manager) DeleteDNSResolver(name string) (Config, error) {
+	return m.mutate("delete", "dns_resolver", name, findDNSResolver(m.Snapshot(), name), func(ctx context.Context, tx *sql.Tx) error {
+		return m.store.deleteDNSResolver(ctx, tx, name)
+	}, func(cfg Config) any {
+		return nil
+	})
+}
+
 func (m *Manager) DeletePeer(name string) (Config, error) {
 	return m.mutate("delete", "peer", name, findPeer(m.Snapshot(), name), func(ctx context.Context, tx *sql.Tx) error {
 		return m.store.deletePeer(ctx, tx, name)
@@ -206,6 +238,8 @@ func (m *Manager) reloadLocked(ctx context.Context, tx *sql.Tx) error {
 		return err
 	}
 	runtime := m.bootstrap.Clone()
+	runtime.TransportDomains = mutable.TransportDomains
+	runtime.DNSResolvers = mutable.DNSResolvers
 	runtime.Peers = mutable.Peers
 	runtime.Routing = mutable.Routing
 	runtime.ApplyDefaults()
@@ -232,6 +266,26 @@ func findPeer(cfg Config, name string) *PeerConfig {
 		if cfg.Peers[i].Name == name {
 			peer := cfg.Peers[i]
 			return &peer
+		}
+	}
+	return nil
+}
+
+func findTransportDomain(cfg Config, name string) *TransportDomainConfig {
+	for i := range cfg.TransportDomains {
+		if cfg.TransportDomains[i].Name == name {
+			domain := cfg.TransportDomains[i]
+			return &domain
+		}
+	}
+	return nil
+}
+
+func findDNSResolver(cfg Config, name string) *DNSResolverConfig {
+	for i := range cfg.DNSResolvers {
+		if cfg.DNSResolvers[i].Name == name {
+			resolver := cfg.DNSResolvers[i]
+			return &resolver
 		}
 	}
 	return nil

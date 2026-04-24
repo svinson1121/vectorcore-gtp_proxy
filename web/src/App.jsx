@@ -2,6 +2,7 @@ import React from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
 import Layout from './components/Layout.jsx'
 import Dashboard from './pages/Dashboard.jsx'
+import Transport from './pages/Transport.jsx'
 import Peers from './pages/Peers.jsx'
 import Routing from './pages/Routing.jsx'
 import Sessions from './pages/Metrics.jsx'
@@ -13,6 +14,7 @@ export default function App() {
       <Route path="/" element={<Layout />}>
         <Route index element={<Navigate to="/dashboard" replace />} />
         <Route path="dashboard" element={<Dashboard />} />
+        <Route path="transport" element={<Transport />} />
         <Route path="peers" element={<Peers />} />
         <Route path="routing" element={<Routing />} />
         <Route path="sessions" element={<Sessions />} />

@@ -1,9 +1,9 @@
 import React, { useCallback, useMemo } from 'react'
-import { RefreshCw, XCircle, History, Route, ServerCog, AlertTriangle } from 'lucide-react'
+import { RefreshCw, XCircle, History, ServerCog, AlertTriangle, Route } from 'lucide-react'
 import Spinner from '../components/Spinner.jsx'
 import StatCard from '../components/StatCard.jsx'
 import { usePoller } from '../hooks/usePoller.js'
-import { getAuditHistory, getMetricDetails, getPeerDiagnostics, getRouteDiagnostics, getStatus } from '../api/client.js'
+import { getAuditHistory, getMetricDetails, getPeerDiagnostics, getRouteDiagnostics, getStatus, getTransportDiagnostics } from '../api/client.js'
 
 function fmtTimestamp(value) {
   if (!value) return '—'
@@ -16,6 +16,7 @@ export default function OAM() {
   const statusState = usePoller(getStatus, 5000)
   const peersState = usePoller(getPeerDiagnostics, 5000)
   const routesState = usePoller(getRouteDiagnostics, 5000)
+  const transportState = usePoller(getTransportDiagnostics, 5000)
   const auditState = usePoller(() => getAuditHistory(25), 5000)
   const metricsState = usePoller(getMetricDetails, 5000)
 
@@ -23,9 +24,10 @@ export default function OAM() {
     statusState.refresh()
     peersState.refresh()
     routesState.refresh()
+    transportState.refresh()
     auditState.refresh()
     metricsState.refresh()
-  }, [auditState, metricsState, peersState, routesState, statusState])
+  }, [auditState, metricsState, peersState, routesState, statusState, transportState])
 
   const loading = statusState.loading && !statusState.data
   const error = statusState.error && !statusState.data ? statusState.error : null
@@ -33,8 +35,7 @@ export default function OAM() {
   const routes = Array.isArray(routesState.data) ? routesState.data : []
   const auditEntries = Array.isArray(auditState.data) ? auditState.data : []
   const metricDetails = metricsState.data || { peer_counters: {}, message_errors: {} }
-  const status = statusState.data || {}
-
+  const transportDomains = Array.isArray(transportState.data?.domains) ? transportState.data.domains : []
   const errorRows = useMemo(() => {
     return Object.entries(metricDetails.message_errors || {})
       .sort((a, b) => b[1] - a[1])
@@ -61,18 +62,18 @@ export default function OAM() {
 
       <div className="stats-grid">
         <StatCard
+          title="Transport Domains"
+          value={(transportDomains.length || 0).toLocaleString()}
+          icon={<ServerCog size={18} />}
+          color="var(--accent)"
+          subtitle={`${transportDomains.filter((domain) => domain.effective).length} effective`}
+        />
+        <StatCard
           title="Peers"
           value={(peers.length || 0).toLocaleString()}
           icon={<ServerCog size={18} />}
           color="var(--accent)"
           subtitle={`${peers.filter((peer) => peer.status === 'active').length} active`}
-        />
-        <StatCard
-          title="Route Decisions"
-          value={(routes.length || 0).toLocaleString()}
-          icon={<Route size={18} />}
-          color="var(--success)"
-          subtitle={`${status.active_sessions || 0} active sessions`}
         />
         <StatCard
           title="Audit Entries"
@@ -89,6 +90,41 @@ export default function OAM() {
           subtitle={`${Object.keys(metricDetails.message_errors || {}).length} distinct counters`}
         />
       </div>
+
+      <div className="section-title">Transport Domains</div>
+      {transportDomains.length === 0 ? (
+        <div className="empty-state">
+          <div className="empty-state-icon"><ServerCog size={32} /></div>
+          <div>No transport domains configured</div>
+        </div>
+      ) : (
+        <div className="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Domain</th>
+                <th>NetNS</th>
+                <th>GTPC</th>
+                <th>GTPU</th>
+                <th>Sessions</th>
+                <th>Warnings</th>
+              </tr>
+            </thead>
+            <tbody>
+              {transportDomains.map((domain) => (
+                <tr key={domain.name}>
+                  <td>{domain.name}{domain.effective ? ' (effective)' : ''}</td>
+                  <td className="mono" style={{ fontSize: '0.74rem' }}>{domain.namespace_present ? domain.netns_path : `${domain.netns_path} [missing]`}</td>
+                  <td className="mono" style={{ fontSize: '0.76rem' }}>{domain.gtpc_socket_state || 'inactive'} / {domain.gtpc_listen}</td>
+                  <td className="mono" style={{ fontSize: '0.76rem' }}>{domain.gtpu_socket_state || 'inactive'} / {domain.gtpu_listen}</td>
+                  <td className="mono">{domain.active_sessions || 0}</td>
+                  <td className="text-muted" style={{ fontSize: '0.74rem' }}>{[...(domain.warnings || []), ...(domain.validation_errors || [])].join('; ') || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       <div className="section-title">Peer Status</div>
       {peers.length === 0 ? (
@@ -146,7 +182,8 @@ export default function OAM() {
                 <th>APN</th>
                 <th>Match Type</th>
                 <th>Match Value</th>
-                <th>Selected Peer</th>
+                <th>Action</th>
+                <th>Target</th>
                 <th>Updated</th>
               </tr>
             </thead>
@@ -158,7 +195,8 @@ export default function OAM() {
                   <td>{route.apn || '—'}</td>
                   <td>{route.route_match_type || '—'}</td>
                   <td className="mono" style={{ fontSize: '0.78rem' }}>{route.route_match_value || '—'}</td>
-                  <td>{route.route_peer || '—'}</td>
+                  <td>{route.route_action_type || 'static_peer'}</td>
+                  <td className="mono" style={{ fontSize: '0.74rem' }}>{route.route_action_type === 'dns_discovery' ? `${route.egress_transport_domain || '—'} / ${route.discovery_fqdn || '—'} / ${route.discovery_method || '—'}` : route.route_peer || '—'}</td>
                   <td className="text-muted" style={{ fontSize: '0.78rem', whiteSpace: 'nowrap' }}>{fmtTimestamp(route.updated_at)}</td>
                 </tr>
               ))}

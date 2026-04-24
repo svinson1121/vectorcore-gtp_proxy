@@ -6,6 +6,7 @@ import Modal from '../components/Modal.jsx'
 import { useToast } from '../components/Toast.jsx'
 import { usePoller } from '../hooks/usePoller.js'
 import {
+  getTransportDomains,
   getPeers, getRouting, setDefaultPeer,
   upsertAPNRoute, deleteAPNRoute,
   upsertIMSIRoute, deleteIMSIRoute,
@@ -24,25 +25,28 @@ export default function Routing() {
   const toast = useToast()
   const routingState = usePoller(getRouting, 5000)
   const peersState = usePoller(getPeers, 5000)
+  const domainsState = usePoller(getTransportDomains, 5000)
   const [tab, setTab] = useState('imsi')
   const [editing, setEditing] = useState(null)
   const [deleting, setDeleting] = useState(null)
   const [settingDefault, setSettingDefault] = useState(false)
 
   const peers = Array.isArray(peersState.data) ? peersState.data.filter((peer) => peer.enabled) : []
+  const domains = Array.isArray(domainsState.data) ? domainsState.data.filter((domain) => domain.enabled) : []
   const routing = routingState.data || { default_peer: '', imsi_routes: [], imsi_prefix_routes: [], apn_routes: [], plmn_routes: [] }
 
   const refreshAll = useCallback(() => {
     routingState.refresh()
     peersState.refresh()
-  }, [peersState, routingState])
+    domainsState.refresh()
+  }, [domainsState, peersState, routingState])
 
   const routes = useMemo(() => {
     switch (tab) {
       case 'imsi':
         return (routing.imsi_routes || []).map((route) => ({ ...route, key: route.imsi, label: route.imsi, matchType: 'imsi' }))
       case 'imsi-prefix':
-        return (routing.imsi_prefix_routes || []).map((route) => ({ ...route, key: route.prefix, label: route.prefix, matchType: 'imsi_prefix' }))
+        return (routing.imsi_prefix_routes || []).map((route) => ({ ...route, key: route.prefix, label: route.prefix, matchType: 'imsi-prefix' }))
       case 'plmn':
         return (routing.plmn_routes || []).map((route) => ({ ...route, key: route.plmn, label: route.plmn, matchType: 'plmn' }))
       default:
@@ -67,7 +71,7 @@ export default function Routing() {
     if (!deleting) return
     try {
       if (deleting.matchType === 'imsi') await deleteIMSIRoute(deleting.label)
-      if (deleting.matchType === 'imsi_prefix') await deleteIMSIPrefixRoute(deleting.label)
+      if (deleting.matchType === 'imsi-prefix') await deleteIMSIPrefixRoute(deleting.label)
       if (deleting.matchType === 'apn') await deleteAPNRoute(deleting.label)
       if (deleting.matchType === 'plmn') await deletePLMNRoute(deleting.label)
       toast.success('Route deleted', deleting.label)
@@ -127,7 +131,7 @@ export default function Routing() {
         <span className="text-muted text-sm">{routes.length} {TABS.find((item) => item.id === tab)?.label} route{routes.length !== 1 ? 's' : ''}</span>
         <div className="flex gap-8">
           <button className="btn btn-ghost btn-sm" onClick={refreshAll}><RefreshCw size={12} /></button>
-          <button className="btn btn-primary btn-sm" onClick={() => setEditing({ label: '', peer: routing.default_peer || '', matchType: tab })}>
+          <button className="btn btn-primary btn-sm" onClick={() => setEditing({ label: '', peer: routing.default_peer || peers[0]?.name || '', action_type: 'static_peer', transport_domain: domains[0]?.name || '', service: '', fqdn: '', matchType: tab })}>
             <Plus size={12} /> Add Route
           </button>
         </div>
@@ -145,18 +149,20 @@ export default function Routing() {
             <thead>
               <tr>
                 <th>Match</th>
-                <th>Peer</th>
+                <th>Action</th>
+                <th>Target</th>
                 <th>Type</th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody>
               {routes.map((route) => (
-                <tr key={route.key}>
-                  <td className="mono" style={{ fontSize: '0.8rem' }}>{route.label}</td>
-                  <td style={{ fontWeight: 600 }}>{route.peer}</td>
-                  <td><Badge state={route.matchType} /></td>
-                  <td>
+                  <tr key={route.key}>
+                    <td className="mono" style={{ fontSize: '0.8rem' }}>{route.label}</td>
+                    <td><Badge state={route.action_type || 'static_peer'} label={route.action_type || 'static_peer'} /></td>
+                    <td style={{ fontWeight: 600 }}>{route.action_type === 'dns_discovery' ? `${route.transport_domain || '—'} / ${route.fqdn || '—'}` : route.peer}</td>
+                    <td><Badge state={route.matchType} /></td>
+                    <td>
                     <div className="flex gap-6">
                       <button className="btn-icon" onClick={() => setEditing(route)}><Edit3 size={13} /></button>
                       <button className="btn-icon danger" onClick={() => setDeleting(route)}><Trash2 size={13} /></button>
@@ -169,13 +175,13 @@ export default function Routing() {
         </div>
       )}
 
-      {editing && <RouteModal initial={editing} peers={peers} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); refreshAll() }} />}
+      {editing && <RouteModal initial={editing} peers={peers} domains={domains} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); refreshAll() }} />}
       {deleting && <ConfirmDeleteModal label={`${deleting.matchType} route "${deleting.label}"`} onClose={() => setDeleting(null)} onConfirm={handleDelete} />}
     </div>
   )
 }
 
-function RouteModal({ initial, peers, onClose, onSaved }) {
+function RouteModal({ initial, peers, domains, onClose, onSaved }) {
   const toast = useToast()
   const [form, setForm] = useState(initial)
   const [submitting, setSubmitting] = useState(false)
@@ -183,7 +189,7 @@ function RouteModal({ initial, peers, onClose, onSaved }) {
 
   const labelByType = {
     imsi: 'IMSI',
-    imsi_prefix: 'IMSI Prefix',
+    'imsi-prefix': 'IMSI Prefix',
     apn: 'APN',
     plmn: 'PLMN',
   }
@@ -191,13 +197,23 @@ function RouteModal({ initial, peers, onClose, onSaved }) {
   const handleSubmit = useCallback(async (event) => {
     event.preventDefault()
     if (!form.label.trim()) { toast.error('Validation', `${labelByType[form.matchType]} is required.`); return }
-    if (!form.peer) { toast.error('Validation', 'Peer is required.'); return }
+    if ((form.action_type || 'static_peer') === 'static_peer' && !form.peer) { toast.error('Validation', 'Peer is required for static routing.'); return }
+    if ((form.action_type || 'static_peer') === 'dns_discovery' && (!form.transport_domain || !form.fqdn.trim())) {
+      toast.error('Validation', 'Transport domain and FQDN are required for DNS discovery.'); return
+    }
     setSubmitting(true)
     try {
-      if (form.matchType === 'imsi') await upsertIMSIRoute(form.label.trim(), form.peer)
-      if (form.matchType === 'imsi-prefix') await upsertIMSIPrefixRoute(form.label.trim(), form.peer)
-      if (form.matchType === 'apn') await upsertAPNRoute(form.label.trim(), form.peer)
-      if (form.matchType === 'plmn') await upsertPLMNRoute(form.label.trim(), form.peer)
+      const payload = {
+        peer: form.peer || '',
+        action_type: form.action_type || 'static_peer',
+        transport_domain: form.transport_domain || '',
+        fqdn: form.fqdn.trim(),
+        service: form.service.trim(),
+      }
+      if (form.matchType === 'imsi') await upsertIMSIRoute(form.label.trim(), payload)
+      if (form.matchType === 'imsi-prefix') await upsertIMSIPrefixRoute(form.label.trim(), payload)
+      if (form.matchType === 'apn') await upsertAPNRoute(form.label.trim(), payload)
+      if (form.matchType === 'plmn') await upsertPLMNRoute(form.label.trim(), payload)
       toast.success('Route saved', form.label.trim())
       onSaved()
     } catch (err) {
@@ -222,17 +238,59 @@ function RouteModal({ initial, peers, onClose, onSaved }) {
           </div>
           <div className="form-group">
             <label className="form-label">{labelByType[form.matchType]}</label>
-            <input className="input mono" value={form.label} onChange={(e) => set('label', e.target.value)} placeholder={form.matchType === 'apn' ? 'internet' : '001010'} />
+            <input className="input mono" value={form.label} onChange={(e) => set('label', e.target.value)} placeholder={form.matchType === 'apn' ? 'internet.mnc001.mcc001.gprs' : '001010'} />
           </div>
           <div className="form-group">
-            <label className="form-label">Peer</label>
-            <select className="select" value={form.peer} onChange={(e) => set('peer', e.target.value)}>
-              <option value="">Select peer</option>
-              {peers.map((peer) => (
-                <option key={peer.name} value={peer.name}>{peer.name}</option>
-              ))}
+            <label className="form-label">Action</label>
+            <select
+              className="select"
+              value={form.action_type || 'static_peer'}
+              onChange={(e) => {
+                const nextAction = e.target.value
+                set('action_type', nextAction)
+                if (nextAction === 'static_peer' && !form.peer && peers[0]?.name) {
+                  set('peer', peers[0].name)
+                }
+                if (nextAction === 'dns_discovery' && !form.transport_domain && domains[0]?.name) {
+                  set('transport_domain', domains[0].name)
+                }
+              }}
+            >
+              <option value="static_peer">Static Peer</option>
+              <option value="dns_discovery">DNS Discovery</option>
             </select>
           </div>
+          {(form.action_type || 'static_peer') === 'static_peer' ? (
+            <div className="form-group">
+              <label className="form-label">Peer</label>
+              <select className="select" value={form.peer || ''} onChange={(e) => set('peer', e.target.value)}>
+                <option value="">Select peer</option>
+                {peers.map((peer) => (
+                  <option key={peer.name} value={peer.name}>{peer.name}</option>
+                ))}
+              </select>
+            </div>
+          ) : (
+            <>
+              <div className="form-group">
+                <label className="form-label">Transport Domain</label>
+                <select className="select" value={form.transport_domain || ''} onChange={(e) => set('transport_domain', e.target.value)}>
+                  <option value="">Select domain</option>
+                  {domains.map((domain) => (
+                    <option key={domain.name} value={domain.name}>{domain.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="form-group">
+                <label className="form-label">FQDN</label>
+                <input className="input mono" value={form.fqdn || ''} onChange={(e) => set('fqdn', e.target.value)} placeholder="topon.s8.pgw.epc.example.net" />
+              </div>
+              <div className="form-group">
+                <label className="form-label">Service</label>
+                <input className="input mono" value={form.service || ''} onChange={(e) => set('service', e.target.value)} placeholder="x-3gpp-pgw" />
+              </div>
+            </>
+          )}
         </div>
         <div className="modal-footer">
           <button type="button" className="btn btn-ghost" onClick={onClose}>Cancel</button>

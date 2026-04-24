@@ -5,24 +5,27 @@ import Spinner from '../components/Spinner.jsx'
 import Modal from '../components/Modal.jsx'
 import { useToast } from '../components/Toast.jsx'
 import { usePoller } from '../hooks/usePoller.js'
-import { deletePeer, getPeers, getStatusPeers, upsertPeer } from '../api/client.js'
+import { deletePeer, getPeers, getStatusPeers, getTransportDomains, upsertPeer } from '../api/client.js'
 
 const DEFAULT_PEER = {
   name: '',
   address: '',
   enabled: true,
   description: '',
+  transport_domain: '',
 }
 
 export default function Peers() {
   const toast = useToast()
   const peersState = usePoller(getPeers, 5000)
   const statusState = usePoller(getStatusPeers, 5000)
+  const domainsState = usePoller(getTransportDomains, 5000)
   const [editing, setEditing] = useState(null)
   const [deleting, setDeleting] = useState(null)
   const [busy, setBusy] = useState(false)
 
   const peers = Array.isArray(peersState.data) ? peersState.data : []
+  const domains = Array.isArray(domainsState.data) ? domainsState.data.filter((domain) => domain.enabled) : []
   const statusMap = useMemo(() => {
     const map = {}
     const items = Array.isArray(statusState.data) ? statusState.data : []
@@ -33,7 +36,8 @@ export default function Peers() {
   const refreshAll = useCallback(() => {
     peersState.refresh()
     statusState.refresh()
-  }, [peersState, statusState])
+    domainsState.refresh()
+  }, [domainsState, peersState, statusState])
 
   const handleDelete = useCallback(async () => {
     if (!deleting) return
@@ -92,6 +96,7 @@ export default function Peers() {
                 <th>Name</th>
                 <th>Address</th>
                 <th>Description</th>
+                <th>Transport Domain</th>
                 <th>Routes</th>
                 <th>Enabled</th>
                 <th>Actions</th>
@@ -105,6 +110,7 @@ export default function Peers() {
                     <td style={{ fontWeight: 600 }}>{peer.name}</td>
                     <td className="mono" style={{ fontSize: '0.8rem' }}>{peer.address}</td>
                     <td className="text-muted" style={{ fontSize: '0.82rem' }}>{peer.description || '—'}</td>
+                    <td>{peer.transport_domain || '—'}</td>
                     <td className="mono">{status?.route_count ?? 0}</td>
                     <td><Badge state={peer.enabled ? 'enabled' : 'disabled'} /></td>
                     <td>
@@ -124,6 +130,7 @@ export default function Peers() {
       {editing && (
         <PeerModal
           initial={editing}
+          domains={domains}
           onClose={() => setEditing(null)}
           onSaved={() => {
             setEditing(null)
@@ -143,7 +150,7 @@ export default function Peers() {
   )
 }
 
-function PeerModal({ initial, onClose, onSaved }) {
+function PeerModal({ initial, domains, onClose, onSaved }) {
   const toast = useToast()
   const [form, setForm] = useState({ ...DEFAULT_PEER, ...initial })
   const [submitting, setSubmitting] = useState(false)
@@ -161,6 +168,7 @@ function PeerModal({ initial, onClose, onSaved }) {
         address: form.address.trim(),
         enabled: !!form.enabled,
         description: form.description.trim(),
+        transport_domain: form.transport_domain || '',
       })
       toast.success(initial?.name ? 'Peer updated' : 'Peer created', form.name.trim())
       onSaved()
@@ -186,6 +194,15 @@ function PeerModal({ initial, onClose, onSaved }) {
           <div className="form-group">
             <label className="form-label">Description</label>
             <input className="input" value={form.description} onChange={(e) => set('description', e.target.value)} />
+          </div>
+          <div className="form-group">
+            <label className="form-label">Transport Domain</label>
+            <select className="select" value={form.transport_domain || ''} onChange={(e) => set('transport_domain', e.target.value)}>
+              <option value="">Select domain</option>
+              {domains.map((domain) => (
+                <option key={domain.name} value={domain.name}>{domain.name}</option>
+              ))}
+            </select>
           </div>
           <label className="checkbox-wrap">
             <input type="checkbox" checked={!!form.enabled} onChange={(e) => set('enabled', e.target.checked)} />

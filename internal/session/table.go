@@ -15,6 +15,11 @@ type Session struct {
 	RouteMatchType          string    `json:"route_match_type,omitempty"`
 	RouteMatchValue         string    `json:"route_match_value,omitempty"`
 	RoutePeer               string    `json:"route_peer,omitempty"`
+	RouteActionType         string    `json:"route_action_type,omitempty"`
+	IngressTransportDomain  string    `json:"ingress_transport_domain,omitempty"`
+	EgressTransportDomain   string    `json:"egress_transport_domain,omitempty"`
+	DiscoveryFQDN           string    `json:"discovery_fqdn,omitempty"`
+	DiscoveryMethod         string    `json:"discovery_method,omitempty"`
 	VisitedControlEndpoint  string    `json:"visited_control_endpoint"`
 	HomeControlEndpoint     string    `json:"home_control_endpoint"`
 	VisitedUserEndpoint     string    `json:"visited_user_endpoint,omitempty"`
@@ -33,11 +38,15 @@ type Session struct {
 }
 
 type PendingTransaction struct {
+	PeerDomain       string
 	PeerAddr         string
 	Sequence         uint32
 	MessageType      uint8
+	OriginalPeerDomain string
 	OriginalPeerAddr string
 	SessionID        string
+	CreatedAt        time.Time
+	ExpiresAt        time.Time
 }
 
 type Snapshot struct {
@@ -58,6 +67,7 @@ type Table struct {
 }
 
 type pendingKey struct {
+	peerDomain  string
 	peerAddr    string
 	sequence    uint32
 	messageType uint8
@@ -80,7 +90,7 @@ func (t *Table) AllocateTEID() uint32 {
 	return t.nextTEID.Add(1)
 }
 
-func (t *Table) Create(visitedAddr *net.UDPAddr, homeAddr, imsi, apn, routeMatchType, routeMatchValue, routePeer string, visitedControlTEID uint32, sessionTTL time.Duration) *Session {
+func (t *Table) Create(visitedAddr *net.UDPAddr, homeAddr, imsi, apn, routeMatchType, routeMatchValue, routePeer, routeActionType, ingressTransportDomain, egressTransportDomain, discoveryFQDN, discoveryMethod string, visitedControlTEID uint32, sessionTTL time.Duration) *Session {
 	now := time.Now().UTC()
 	s := &Session{
 		ID:                      fmt.Sprintf("%d-%d", now.UnixNano(), t.AllocateTEID()),
@@ -89,6 +99,11 @@ func (t *Table) Create(visitedAddr *net.UDPAddr, homeAddr, imsi, apn, routeMatch
 		RouteMatchType:          routeMatchType,
 		RouteMatchValue:         routeMatchValue,
 		RoutePeer:               routePeer,
+		RouteActionType:         routeActionType,
+		IngressTransportDomain:  ingressTransportDomain,
+		EgressTransportDomain:   egressTransportDomain,
+		DiscoveryFQDN:           discoveryFQDN,
+		DiscoveryMethod:         discoveryMethod,
 		VisitedControlEndpoint:  visitedAddr.String(),
 		HomeControlEndpoint:     homeAddr,
 		VisitedControlTEID:      visitedControlTEID,
@@ -105,7 +120,7 @@ func (t *Table) Create(visitedAddr *net.UDPAddr, homeAddr, imsi, apn, routeMatch
 	return cloneSession(s)
 }
 
-func (t *Table) BindHomeControl(sessionID string, homeControlTEID uint32) (*Session, error) {
+func (t *Table) BindHomeControl(sessionID string, homeControlTEID uint32, sessionTTL time.Duration) (*Session, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -118,7 +133,7 @@ func (t *Table) BindHomeControl(sessionID string, homeControlTEID uint32) (*Sess
 		s.ProxyHomeControlTEID = t.AllocateTEID()
 	}
 	s.UpdatedAt = time.Now().UTC()
-	s.ExpiresAt = s.UpdatedAt
+	s.ExpiresAt = s.UpdatedAt.Add(sessionTTL)
 	t.byProxyHomeTEID[s.ProxyHomeControlTEID] = s
 	return cloneSession(s), nil
 }
@@ -171,6 +186,16 @@ func (t *Table) GetByProxyHomeControlTEID(teid uint32) (*Session, bool) {
 	return cloneSession(s), true
 }
 
+func (t *Table) GetByProxyHomeControlTEIDFromPeer(teid uint32, peerDomain, peerAddr string) (*Session, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	s, ok := t.byProxyHomeTEID[teid]
+	if !ok || s.IngressTransportDomain != peerDomain || !sameEndpoint(s.VisitedControlEndpoint, peerAddr) {
+		return nil, false
+	}
+	return cloneSession(s), true
+}
+
 func (t *Table) GetByProxyVisitedUserTEID(teid uint32) (*Session, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -181,11 +206,31 @@ func (t *Table) GetByProxyVisitedUserTEID(teid uint32) (*Session, bool) {
 	return cloneSession(s), true
 }
 
+func (t *Table) GetByProxyVisitedUserTEIDFromPeer(teid uint32, peerDomain, peerAddr string) (*Session, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	s, ok := t.byProxyVisitedUser[teid]
+	if !ok || s.EgressTransportDomain != peerDomain || !sameEndpoint(s.HomeUserEndpoint, peerAddr) {
+		return nil, false
+	}
+	return cloneSession(s), true
+}
+
 func (t *Table) GetByProxyHomeUserTEID(teid uint32) (*Session, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	s, ok := t.byProxyHomeUser[teid]
 	if !ok {
+		return nil, false
+	}
+	return cloneSession(s), true
+}
+
+func (t *Table) GetByProxyHomeUserTEIDFromPeer(teid uint32, peerDomain, peerAddr string) (*Session, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	s, ok := t.byProxyHomeUser[teid]
+	if !ok || s.IngressTransportDomain != peerDomain || !sameEndpoint(s.VisitedUserEndpoint, peerAddr) {
 		return nil, false
 	}
 	return cloneSession(s), true
@@ -224,23 +269,42 @@ func (t *Table) Delete(id string) {
 func (t *Table) AddPending(tx PendingTransaction) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	now := time.Now().UTC()
+	if tx.CreatedAt.IsZero() {
+		tx.CreatedAt = now
+	}
+	if tx.ExpiresAt.IsZero() {
+		tx.ExpiresAt = now.Add(30 * time.Second)
+	}
 	t.pendingTransactions[pendingKey{
+		peerDomain:  tx.PeerDomain,
 		peerAddr:    tx.PeerAddr,
 		sequence:    tx.Sequence,
 		messageType: tx.MessageType,
 	}] = tx
 }
 
-func (t *Table) PopPending(peerAddr string, sequence uint32, messageType uint8) (PendingTransaction, bool) {
+func (t *Table) PopPending(peerDomain, peerAddr string, sequence uint32, messageType uint8) (PendingTransaction, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	key := pendingKey{peerAddr: peerAddr, sequence: sequence, messageType: messageType}
+	key := pendingKey{peerDomain: peerDomain, peerAddr: peerAddr, sequence: sequence, messageType: messageType}
 	tx, ok := t.pendingTransactions[key]
 	if !ok {
 		return PendingTransaction{}, false
 	}
 	delete(t.pendingTransactions, key)
 	return tx, true
+}
+
+func (t *Table) DeletePending(peerDomain, peerAddr string, sequence uint32, messageType uint8) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.pendingTransactions, pendingKey{
+		peerDomain:  peerDomain,
+		peerAddr:    peerAddr,
+		sequence:    sequence,
+		messageType: messageType,
+	})
 }
 
 func (t *Table) List() []Session {
@@ -251,6 +315,30 @@ func (t *Table) List() []Session {
 		out = append(out, *cloneSession(s))
 	}
 	return out
+}
+
+func (t *Table) CountByRoutePeer(peer string) int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	count := 0
+	for _, s := range t.byID {
+		if s.RoutePeer == peer {
+			count++
+		}
+	}
+	return count
+}
+
+func (t *Table) CountByTransportDomain(domain string) int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	count := 0
+	for _, s := range t.byID {
+		if s.EgressTransportDomain == domain || s.IngressTransportDomain == domain {
+			count++
+		}
+	}
+	return count
 }
 
 func (t *Table) Stats() Snapshot {
@@ -289,10 +377,30 @@ func (t *Table) CleanupExpired(now time.Time) []string {
 			delete(t.byProxyHomeUser, s.ProxyHomeUserTEID)
 		}
 	}
+	for key, tx := range t.pendingTransactions {
+		if !tx.ExpiresAt.IsZero() && !now.Before(tx.ExpiresAt) {
+			delete(t.pendingTransactions, key)
+		}
+	}
 	return deleted
 }
 
 func cloneSession(s *Session) *Session {
 	cp := *s
 	return &cp
+}
+
+func sameEndpoint(expected, actual string) bool {
+	expectedAddr, errExpected := net.ResolveUDPAddr("udp", expected)
+	actualAddr, errActual := net.ResolveUDPAddr("udp", actual)
+	if errExpected != nil || errActual != nil {
+		return expected == actual
+	}
+	if expectedAddr.Port != actualAddr.Port {
+		return false
+	}
+	if expectedAddr.IP == nil || actualAddr.IP == nil {
+		return expected == actual
+	}
+	return expectedAddr.IP.Equal(actualAddr.IP)
 }

@@ -10,20 +10,13 @@ import (
 
 func TestParseAppliesDefaultsAndValidates(t *testing.T) {
 	data := []byte(`
-proxy:
-  gtpc:
-    advertise_address: 127.0.0.1
+database:
+  path: ./runtime.db
 `)
 
 	cfg, err := Parse(data)
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
-	}
-	if cfg.Proxy.GTPC.Listen != "0.0.0.0:2123" {
-		t.Fatalf("unexpected GTPC listen default %q", cfg.Proxy.GTPC.Listen)
-	}
-	if cfg.Proxy.GTPU.Listen != "0.0.0.0:2152" {
-		t.Fatalf("unexpected GTPU listen default %q", cfg.Proxy.GTPU.Listen)
 	}
 	if cfg.API.Listen != "0.0.0.0:8080" {
 		t.Fatalf("unexpected API listen default %q", cfg.API.Listen)
@@ -31,11 +24,11 @@ proxy:
 	if cfg.Log.Level != "info" {
 		t.Fatalf("unexpected log level default %q", cfg.Log.Level)
 	}
-	if cfg.Database.Path != "./gtp_proxy.db" {
-		t.Fatalf("unexpected database path default %q", cfg.Database.Path)
+	if cfg.Log.File != "" {
+		t.Fatalf("unexpected log file default %q", cfg.Log.File)
 	}
-	if cfg.Proxy.GTPC.AdvertiseAddressIPv4 != "127.0.0.1" {
-		t.Fatalf("unexpected IPv4 advertise default %q", cfg.Proxy.GTPC.AdvertiseAddressIPv4)
+	if cfg.Database.Path != "./runtime.db" {
+		t.Fatalf("unexpected database path default %q", cfg.Database.Path)
 	}
 	if cfg.Proxy.Timeouts.SessionIdleDuration() <= 0 {
 		t.Fatal("expected session idle timeout default")
@@ -68,14 +61,6 @@ func TestValidateRuntimeRejectsInvalidDefaultPeer(t *testing.T) {
 func TestValidateBootstrapAcceptsIPv6Addresses(t *testing.T) {
 	cfg := Config{
 		Proxy: ProxyConfig{
-			GTPC: GTPCConfig{
-				Listen:               "[::]:2123",
-				AdvertiseAddressIPv6: "2001:db8::10",
-			},
-			GTPU: GTPUConfig{
-				Listen:               "[::]:2152",
-				AdvertiseAddressIPv6: "2001:db8::11",
-			},
 			Timeouts: TimeoutsConfig{SessionIdle: "15m", CleanupInterval: "30s"},
 		},
 		API:      APIConfig{Listen: "[::1]:8080"},
@@ -85,6 +70,120 @@ func TestValidateBootstrapAcceptsIPv6Addresses(t *testing.T) {
 
 	if err := cfg.ValidateBootstrap(); err != nil {
 		t.Fatalf("Validate() IPv6 error = %v", err)
+	}
+}
+
+func TestValidateBootstrapRejectsLogFileDirectory(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{
+		Proxy: ProxyConfig{
+			Timeouts: TimeoutsConfig{SessionIdle: "15m", CleanupInterval: "30s"},
+		},
+		API:      APIConfig{Listen: "127.0.0.1:8080"},
+		Log:      LogConfig{Level: "info", File: dir},
+		Database: DatabaseConfig{Path: filepath.Join(dir, "config.db")},
+	}
+
+	if err := cfg.ValidateBootstrap(); err == nil {
+		t.Fatal("ValidateBootstrap() expected error for directory log.file, got nil")
+	}
+}
+
+func TestEffectiveTransportConfigsUsePrimaryTransportDomain(t *testing.T) {
+	cfg := Config{
+		Proxy: ProxyConfig{
+			Timeouts: TimeoutsConfig{SessionIdle: "15m", CleanupInterval: "30s"},
+		},
+		API:      APIConfig{Listen: "0.0.0.0:8080"},
+		Log:      LogConfig{Level: "info"},
+		Database: DatabaseConfig{Path: filepath.Join(t.TempDir(), "config.db")},
+		TransportDomains: []TransportDomainConfig{
+			{
+				Name:              "home-a",
+				NetNSPath:         "/var/run/netns/home-a",
+				Enabled:           true,
+				GTPCListenHost:    "192.0.2.10",
+				GTPCPort:          2123,
+				GTPUListenHost:    "192.0.2.10",
+				GTPUPort:          2152,
+				GTPCAdvertiseIPv4: "192.0.2.10",
+				GTPUAdvertiseIPv4: "192.0.2.20",
+			},
+		},
+	}
+
+	gtpc, ok := cfg.EffectiveGTPCConfig()
+	if !ok || gtpc.Listen != "192.0.2.10:2123" || gtpc.AdvertiseAddressIPv4 != "192.0.2.10" {
+		t.Fatalf("unexpected effective GTPC config %+v ok=%v", gtpc, ok)
+	}
+	gtpu, ok := cfg.EffectiveGTPUConfig()
+	if !ok || gtpu.Listen != "192.0.2.10:2152" || gtpu.AdvertiseAddressIPv4 != "192.0.2.20" {
+		t.Fatalf("unexpected effective GTPU config %+v ok=%v", gtpu, ok)
+	}
+}
+
+func TestValidateRuntimeRejectsDNSResolverWithUnknownTransportDomain(t *testing.T) {
+	cfg := Config{
+		Proxy: ProxyConfig{
+			GTPC:     GTPCConfig{Listen: "0.0.0.0:2123", AdvertiseAddress: "127.0.0.1"},
+			GTPU:     GTPUConfig{Listen: "0.0.0.0:2152", AdvertiseAddress: "127.0.0.1"},
+			Timeouts: TimeoutsConfig{SessionIdle: "15m", CleanupInterval: "30s"},
+		},
+		API:      APIConfig{Listen: "0.0.0.0:8080"},
+		Log:      LogConfig{Level: "info"},
+		Database: DatabaseConfig{Path: filepath.Join(t.TempDir(), "config.db")},
+		DNSResolvers: []DNSResolverConfig{
+			{
+				Name:            "home-dns",
+				TransportDomain: "missing",
+				Server:          "127.0.0.1:53",
+				Priority:        100,
+				TimeoutMS:       2000,
+				Attempts:        2,
+				Enabled:         true,
+			},
+		},
+	}
+
+	if err := cfg.ValidateRuntime(); err == nil {
+		t.Fatal("ValidateRuntime() expected error, got nil")
+	}
+}
+
+func TestValidateRuntimeRejectsDNSDiscoveryRouteWithoutFQDN(t *testing.T) {
+	cfg := Config{
+		Proxy: ProxyConfig{
+			Timeouts: TimeoutsConfig{SessionIdle: "15m", CleanupInterval: "30s"},
+		},
+		API:      APIConfig{Listen: "0.0.0.0:8080"},
+		Log:      LogConfig{Level: "info"},
+		Database: DatabaseConfig{Path: filepath.Join(t.TempDir(), "config.db")},
+		TransportDomains: []TransportDomainConfig{
+			{
+				Name:              "home-a",
+				NetNSPath:         "/var/run/netns/home-a",
+				Enabled:           true,
+				GTPCListenHost:    "192.0.2.10",
+				GTPCPort:          2123,
+				GTPUListenHost:    "192.0.2.10",
+				GTPUPort:          2152,
+				GTPCAdvertiseIPv4: "192.0.2.10",
+				GTPUAdvertiseIPv4: "192.0.2.10",
+			},
+		},
+		Routing: RoutingConfig{
+			APNRoutes: []APNRoute{
+				{
+					APN:             "ims",
+					ActionType:      "dns_discovery",
+					TransportDomain: "home-a",
+				},
+			},
+		},
+	}
+
+	if err := cfg.ValidateRuntime(); err == nil {
+		t.Fatal("ValidateRuntime() expected error, got nil")
 	}
 }
 
@@ -148,6 +247,30 @@ database:
 	}
 }
 
+func TestLoadManagerAllowsMinimalBootstrapWithEmptyMutableRuntime(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	dbPath := filepath.Join(dir, "runtime.db")
+	initialYAML := strings.TrimSpace(`
+database:
+  path: `+dbPath+`
+`) + "\n"
+	if err := os.WriteFile(cfgPath, []byte(initialYAML), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	manager, err := LoadManager(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadManager() error = %v", err)
+	}
+	defer manager.Close()
+
+	snapshot := manager.Snapshot()
+	if len(snapshot.TransportDomains) != 0 || len(snapshot.DNSResolvers) != 0 || len(snapshot.Peers) != 0 {
+		t.Fatalf("unexpected non-empty runtime snapshot: %+v", snapshot)
+	}
+}
+
 func TestManagerRollsBackInvalidPeerDelete(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")
@@ -183,6 +306,161 @@ database:
 	snapshot := manager.Snapshot()
 	if len(snapshot.Peers) != 1 || snapshot.Routing.DefaultPeer != "pgw-a" {
 		t.Fatalf("unexpected runtime snapshot after rollback: %+v", snapshot)
+	}
+}
+
+func TestManagerPersistsTransportDomainsAndResolversToSQLiteWithoutRewritingYAML(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	dbPath := filepath.Join(dir, "runtime.db")
+	initialYAML := strings.TrimSpace(`
+proxy:
+  gtpc:
+    advertise_address_ipv4: 127.0.0.1
+database:
+  path: `+dbPath+`
+`) + "\n"
+	if err := os.WriteFile(cfgPath, []byte(initialYAML), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	manager, err := LoadManager(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadManager() error = %v", err)
+	}
+	defer manager.Close()
+
+	if _, err := manager.UpsertTransportDomain(TransportDomainConfig{
+		Name:              "home-a",
+		NetNSPath:         "/var/run/netns/home-a",
+		Enabled:           true,
+		GTPCListenHost:    "192.0.2.10",
+		GTPCPort:          2123,
+		GTPUListenHost:    "192.0.2.10",
+		GTPUPort:          2152,
+		GTPCAdvertiseIPv4: "192.0.2.10",
+		GTPUAdvertiseIPv4: "192.0.2.10",
+	}); err != nil {
+		t.Fatalf("UpsertTransportDomain() error = %v", err)
+	}
+	if _, err := manager.UpsertDNSResolver(DNSResolverConfig{
+		Name:            "home-a-primary",
+		TransportDomain: "home-a",
+		Server:          "192.0.2.53:53",
+		Priority:        10,
+		TimeoutMS:       1500,
+		Attempts:        2,
+		SearchDomain:    "epc.mnc001.mcc001.3gppnetwork.org",
+		Enabled:         true,
+	}); err != nil {
+		t.Fatalf("UpsertDNSResolver() error = %v", err)
+	}
+	if _, err := manager.UpsertPeer(PeerConfig{
+		Name:            "pgw-a",
+		Address:         "192.0.2.20:2123",
+		TransportDomain: "home-a",
+		Enabled:         true,
+	}); err != nil {
+		t.Fatalf("UpsertPeer() error = %v", err)
+	}
+
+	snapshot := manager.Snapshot()
+	if len(snapshot.TransportDomains) != 1 || len(snapshot.DNSResolvers) != 1 || len(snapshot.Peers) != 1 {
+		t.Fatalf("unexpected runtime snapshot after transport updates: %+v", snapshot)
+	}
+	if snapshot.Peers[0].TransportDomain != "home-a" {
+		t.Fatalf("unexpected peer transport domain %+v", snapshot.Peers[0])
+	}
+
+	manager2, err := LoadManager(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadManager() reload error = %v", err)
+	}
+	defer manager2.Close()
+
+	reloaded := manager2.Snapshot()
+	if len(reloaded.TransportDomains) != 1 || len(reloaded.DNSResolvers) != 1 || len(reloaded.Peers) != 1 {
+		t.Fatalf("unexpected reloaded runtime snapshot: %+v", reloaded)
+	}
+	if reloaded.DNSResolvers[0].TransportDomain != "home-a" {
+		t.Fatalf("unexpected reloaded resolver %+v", reloaded.DNSResolvers[0])
+	}
+
+	afterYAML, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(afterYAML) != initialYAML {
+		t.Fatalf("expected bootstrap YAML to remain unchanged\ngot:\n%s\nwant:\n%s", string(afterYAML), initialYAML)
+	}
+}
+
+func TestManagerPersistsDNSDiscoveryRouteFields(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	dbPath := filepath.Join(dir, "runtime.db")
+	initialYAML := strings.TrimSpace(`
+database:
+  path: `+dbPath+`
+`) + "\n"
+	if err := os.WriteFile(cfgPath, []byte(initialYAML), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	manager, err := LoadManager(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadManager() error = %v", err)
+	}
+	defer manager.Close()
+
+	if _, err := manager.UpsertTransportDomain(TransportDomainConfig{
+		Name:              "home-a",
+		NetNSPath:         "/var/run/netns/home-a",
+		Enabled:           true,
+		GTPCListenHost:    "192.0.2.10",
+		GTPCPort:          2123,
+		GTPUListenHost:    "192.0.2.10",
+		GTPUPort:          2152,
+		GTPCAdvertiseIPv4: "192.0.2.10",
+		GTPUAdvertiseIPv4: "192.0.2.20",
+	}); err != nil {
+		t.Fatalf("UpsertTransportDomain() error = %v", err)
+	}
+	if _, err := manager.UpsertDNSResolver(DNSResolverConfig{
+		Name:            "home-a-primary",
+		TransportDomain: "home-a",
+		Server:          "192.0.2.53:53",
+		Priority:        10,
+		TimeoutMS:       1500,
+		Attempts:        2,
+		SearchDomain:    "epc.example.net",
+		Enabled:         true,
+	}); err != nil {
+		t.Fatalf("UpsertDNSResolver() error = %v", err)
+	}
+	if _, err := manager.UpsertAPNRoute(APNRoute{
+		APN:             "ims",
+		ActionType:      "dns_discovery",
+		TransportDomain: "home-a",
+		FQDN:            "topon.s8.pgw.epc.example.net",
+		Service:         "x-3gpp-pgw",
+	}); err != nil {
+		t.Fatalf("UpsertAPNRoute() error = %v", err)
+	}
+
+	manager2, err := LoadManager(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadManager() reload error = %v", err)
+	}
+	defer manager2.Close()
+
+	reloaded := manager2.Snapshot()
+	if len(reloaded.Routing.APNRoutes) != 1 {
+		t.Fatalf("unexpected APN route count: %+v", reloaded.Routing.APNRoutes)
+	}
+	route := reloaded.Routing.APNRoutes[0]
+	if route.ActionType != "dns_discovery" || route.TransportDomain != "home-a" || route.FQDN != "topon.s8.pgw.epc.example.net" || route.Service != "x-3gpp-pgw" {
+		t.Fatalf("unexpected reloaded DNS discovery route: %+v", route)
 	}
 }
 

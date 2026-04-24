@@ -16,7 +16,7 @@ func TestHandlerExposesPrometheusMetrics(t *testing.T) {
 	registry := New()
 	table := session.NewTable()
 	visited := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 2123}
-	table.Create(visited, "198.51.100.10:2123", "001010123456789", "internet", "apn", "internet", "pgw", 1111, time.Minute)
+	table.Create(visited, "198.51.100.10:2123", "001010123456789", "internet", "apn", "internet", "pgw", "static_peer", "visited-a", "home-a", "", "", 1111, time.Minute)
 
 	registry.IncSessionCreate()
 	registry.IncSessionDelete()

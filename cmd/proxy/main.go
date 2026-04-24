@@ -16,13 +16,21 @@ import (
 	"github.com/vectorcore/gtp_proxy/internal/logging"
 	"github.com/vectorcore/gtp_proxy/internal/metrics"
 	"github.com/vectorcore/gtp_proxy/internal/session"
+	"github.com/vectorcore/gtp_proxy/internal/transport"
 )
 
 var version = "dev"
 
 func main() {
 	cfgPath := flag.String("c", "config.yaml", "path to config file")
+	debugLogs := flag.Bool("d", false, "display debug logs on the console")
+	showVersion := flag.Bool("v", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	manager, err := config.LoadManager(*cfgPath)
 	if err != nil {
@@ -31,11 +39,21 @@ func main() {
 	}
 	defer manager.Close()
 
-	logger, err := logging.New(manager.Snapshot().Log.Level)
+	logCfg := manager.Snapshot().Log
+	logger, closeLogs, err := logging.New(logging.Options{
+		Level:        logCfg.Level,
+		File:         logCfg.File,
+		DebugConsole: *debugLogs,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "setup logging: %v\n", err)
 		os.Exit(1)
 	}
+	defer func() {
+		if err := closeLogs(); err != nil {
+			fmt.Fprintf(os.Stderr, "close logs: %v\n", err)
+		}
+	}()
 	slog.SetDefault(logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -43,9 +61,10 @@ func main() {
 
 	sessions := session.NewTable()
 	registry := metrics.New()
-	gtpcServer := gtpc.NewServer(manager, sessions, registry, logger)
-	gtpuServer := gtpu.NewServer(manager, sessions, registry, logger)
-	apiServer := api.New(manager, sessions, registry, version, logger)
+	transportRuntime := transport.NewRuntime()
+	gtpcServer := gtpc.NewServer(manager, sessions, registry, transportRuntime, logger)
+	gtpuServer := gtpu.NewServer(manager, sessions, registry, transportRuntime, logger)
+	apiServer := api.New(manager, sessions, registry, transportRuntime, version, logger)
 	cleanupCh := session.StartCleanupLoop(ctx, sessions, manager.Snapshot().Proxy.Timeouts.CleanupIntervalDuration(), logger)
 	go func() {
 		for n := range cleanupCh {

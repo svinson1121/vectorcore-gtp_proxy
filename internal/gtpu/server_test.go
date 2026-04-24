@@ -12,6 +12,7 @@ import (
 	"github.com/vectorcore/gtp_proxy/internal/config"
 	"github.com/vectorcore/gtp_proxy/internal/metrics"
 	"github.com/vectorcore/gtp_proxy/internal/session"
+	"github.com/vectorcore/gtp_proxy/internal/transport"
 )
 
 func TestHandlePacketForwardsUsingSessionState(t *testing.T) {
@@ -44,10 +45,10 @@ routing:
 	table := session.NewTable()
 	logger := slog.New(slog.NewTextHandler(ioDiscard{}, nil))
 	registry := metrics.New()
-	server := NewServer(manager, table, registry, logger)
+	server := NewServer(manager, table, registry, transport.NewRuntime(), logger)
 
-	visited := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 2123}
-	sess := table.Create(visited, "198.51.100.10:2123", "001010123456789", "internet", "apn", "internet", "pgw", 1111, time.Minute)
+	visitedControl := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 2123}
+	sess := table.Create(visitedControl, "198.51.100.10:2123", "001010123456789", "internet", "apn", "internet", "pgw", "static_peer", "visited-a", "home-a", "", "", 1111, time.Minute)
 
 	destConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
@@ -65,6 +66,15 @@ routing:
 		t.Fatalf("ListenUDP(src) error = %v", err)
 	}
 	defer srcConn.Close()
+	srcAddr, ok := srcConn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("unexpected src local addr type %T", srcConn.LocalAddr())
+	}
+	sess, err = table.UpsertVisitedUserPlane(sess.ID, srcAddr.String(), 0x87654321, time.Minute)
+	if err != nil {
+		t.Fatalf("UpsertVisitedUserPlane() error = %v", err)
+	}
+	server.conns["home-a"] = srcConn
 
 	packet := make([]byte, 8)
 	packet[0] = 0x30
@@ -72,7 +82,7 @@ routing:
 	binary.BigEndian.PutUint16(packet[2:4], 8)
 	binary.BigEndian.PutUint32(packet[4:8], sess.ProxyHomeUserTEID)
 
-	if err := server.handlePacket(srcConn, visited, packet); err != nil {
+	if err := server.handlePacket("visited-a", srcAddr, packet); err != nil {
 		t.Fatalf("handlePacket() error = %v", err)
 	}
 
